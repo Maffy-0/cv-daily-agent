@@ -6,7 +6,7 @@ paths:
 arxiv:
   max_results: 120
   delay_seconds: 3.0
-  only_new: true
+  only_new: false
 
   query: >
     (cat:cs.CV OR cat:cs.AI OR cat:cs.LG OR cat:cs.RO)
