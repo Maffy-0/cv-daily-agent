@@ -33,6 +33,7 @@ jobs:
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
         run: |
+          python -c "import os; k=os.getenv('GOOGLE_API_KEY',''); print('GOOGLE_API_KEY set:', bool(k), 'len=', len(k))"
           uv run daily_cv_digest.py config.yaml
 
       - name: Commit outputs
