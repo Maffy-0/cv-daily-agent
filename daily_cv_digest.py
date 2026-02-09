@@ -146,23 +146,60 @@ def gemini_generate(model: str, api_key: str, prompt: str, max_output_tokens: in
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": float(temperature), "maxOutputTokens": int(max_output_tokens)},
+        "generationConfig": {
+            "temperature": float(temperature),
+            "maxOutputTokens": int(max_output_tokens),
+        },
     }
 
-    # very small retry for transient errors
-    for attempt in range(3):
+    last_debug = ""
+    for attempt in range(5):
         resp = requests.post(url, json=payload, timeout=30)
+
+        # transient retry
         if resp.status_code in (429, 500, 502, 503, 504):
             time.sleep(2 ** attempt)
             continue
+
+        # 401/403/400 などはここで落ちる（=キー/権限/リクエスト不正が分かる）
         resp.raise_for_status()
         data = resp.json()
-        try:
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception:
-            return "（要約生成に失敗）"
 
-    return "（要約生成に失敗: retry exhausted）"
+        # 念のため error を拾う（通常は4xxになるが、まれに200でも入ることがある）
+        if isinstance(data, dict) and "error" in data:
+            err = data["error"]
+            return f"（要約生成に失敗: API error {err.get('code')} {err.get('status')} {err.get('message')}）"
+
+        candidates = data.get("candidates") or []
+        if not candidates:
+            pf = data.get("promptFeedback") or {}
+            block = pf.get("blockReason")
+            last_debug = f"no candidates; blockReason={block}"
+            time.sleep(1.5 * (attempt + 1))
+            continue
+
+        c0 = candidates[0]
+        finish = c0.get("finishReason")
+        content = c0.get("content") or {}
+        parts = content.get("parts") or []
+
+        # parts の text を全部結合（parts[0]固定をやめる）
+        texts = []
+        for p in parts:
+            t = p.get("text")
+            if t:
+                texts.append(t)
+        text_out = "\n".join(texts).strip()
+
+        if text_out:
+            return text_out
+
+        # 200だけど空（finishReasonだけある等）→ リトライ
+        last_debug = f"empty text; finishReason={finish}; parts={len(parts)}"
+        time.sleep(1.5 * (attempt + 1))
+
+    return f"（要約生成に失敗: retry exhausted; last={last_debug}）"
+
 
 
 def summarize_with_gemini(model: str, title: str, abstract: str, max_output_tokens: int, temperature: float) -> str:
