@@ -1,0 +1,63 @@
+name: daily-cv-digest
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "10 0 * * *"  # UTC 00:10 = JST 09:10
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          uv sync
+
+      - name: Run digest
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          uv run daily_cv_digest.py config.yaml
+
+      - name: Commit outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add out/*.md data/seen.json || true
+
+          if git diff --cached --quiet; then
+            echo "NO_CHANGES=1" >> $GITHUB_ENV
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "daily digest"
+          git push
+
+          echo "NEW_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+      - name: Notify Discord
+        if: env.NO_CHANGES != '1'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # 最新の out/*.md を拾って投稿
+          LATEST_MD=$(ls -1t out/*.md | head -n 1)
+          uv run notify_discord.py "$LATEST_MD" 10

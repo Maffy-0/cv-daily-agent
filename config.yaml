@@ -1,0 +1,87 @@
+paths:
+  data_dir: data
+  out_dir: out
+  seen_path: data/seen.json
+
+arxiv:
+  max_results: 120
+  delay_seconds: 3.0
+  only_new: true
+
+  query: >
+    (cat:cs.CV OR cat:cs.AI OR cat:cs.LG OR cat:cs.RO)
+    AND
+    (ti:video OR abs:video OR ti:"action" OR abs:"action"
+     OR ti:agent OR abs:agent OR ti:"vision-language" OR abs:"vision-language"
+     OR ti:VLM OR abs:VLM OR ti:VLA OR abs:VLA)
+
+filter:
+  enable: true
+  top_k: 20
+  min_score: 1
+
+  required_any:
+    - video
+    - vision
+    - visual
+    - image
+    - camera
+    - spatio-temporal
+    - vlm
+    - vla
+    - vision-language
+    - robot
+    - manipulation
+    - embodied
+
+  keywords:
+    - action recognition
+    - action detection
+    - online action
+    - temporal action
+    - action anticipation
+    - temporal localization
+    - streaming
+    - real-time
+    - video understanding
+    - video-language
+    - vision-language-action
+    - embodied agent
+    - robot policy
+    - reinforcement learning
+    - imitation learning
+    - behavior cloning
+    - game ai
+    - multi-agent
+    - marl
+
+  # 重複を整理＋短すぎる語は避ける（"screen" みたいなのは誤爆しやすい）
+  exclude:
+    - medical
+    - surgical
+    - retina
+    - ultrasound
+    - "mri scan"
+    - "ct scan"
+    - "gui grounding"
+    - "document parsing"
+    - "vehicle routing"
+    - "low-rank adaptation"
+    - lora
+    - retrieval
+    - negotiation
+    - conversational
+
+summarizer:
+  enable: true
+  model: gemini-2.5-flash-lite
+
+  # バッチ要約にするので出力トークンは少し増やす（20本を4回で処理する想定）
+  # もし長すぎるなら 700→500 に落としてOK
+  max_output_tokens: 700
+  temperature: 0.2
+
+  batch:
+    enable: true
+    batch_size: 5          # 20本 -> 4リクエスト/日（RPD=20に対して超安全）
+    abstract_max_chars: 1200
