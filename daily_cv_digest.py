@@ -4,7 +4,7 @@
 """
 Daily CV Digest (config.yaml driven)
 - Fetch arXiv papers by query
-- Deduplicate using data/seen.json
+- Deduplicate using seen.json
 - Filter by keywords (optional)
 - Summarize with Gemini (optional, supports batch)
 - Write out/YYYY-MM-DD.md
@@ -25,7 +25,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from zoneinfo import ZoneInfo
 
 import arxiv
@@ -65,8 +65,7 @@ def save_seen(seen_path: Path, seen: Dict[str, str]) -> None:
     seen_path.write_text(json.dumps(seen, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def today_str_with_offset_hours() -> str:
-    # offset_hours は互換のため残す（使わない）
+def today_str_jst() -> str:
     return dt.datetime.now(ZoneInfo("Asia/Tokyo")).date().isoformat()
 
 
@@ -80,7 +79,11 @@ def fetch_arxiv(query: str, max_results: int, delay_seconds: float = 3.0) -> Lis
         max_results=max_results,
         sort_by=arxiv.SortCriterion.SubmittedDate,
     )
-    client = arxiv.Client(page_size=min(max_results, 100), delay_seconds=delay_seconds, num_retries=3)
+    client = arxiv.Client(
+        page_size=min(max_results, 100),
+        delay_seconds=delay_seconds,
+        num_retries=3,
+    )
 
     results: List[dict] = []
     for r in client.results(search):
@@ -107,6 +110,13 @@ def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
+def passes_gate(title: str, abstract: str, required_any: List[str]) -> bool:
+    if not required_any:
+        return True
+    text = f"{title}\n{abstract}".lower()
+    return any((w.strip().lower() in text) for w in required_any if w.strip())
+
+
 def keyword_score(title: str, abstract: str, keywords: List[str], exclude: List[str]) -> Tuple[int, List[str]]:
     text = f"{title}\n{abstract}".lower()
 
@@ -131,18 +141,17 @@ def keyword_score(title: str, abstract: str, keywords: List[str], exclude: List[
     return score, hits
 
 
-def passes_gate(title: str, abstract: str, required_any: List[str]) -> bool:
-    if not required_any:
-        return True
-    text = f"{title}\n{abstract}".lower()
-    return any((w.strip().lower() in text) for w in required_any if w.strip())
-
-
 # -----------------------
 # Gemini
 # -----------------------
 
-def gemini_generate(model: str, api_key: str, prompt: str, max_output_tokens: int, temperature: float) -> str:
+def gemini_generate(
+    model: str,
+    api_key: str,
+    prompt: str,
+    max_output_tokens: int,
+    temperature: float,
+) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -154,27 +163,32 @@ def gemini_generate(model: str, api_key: str, prompt: str, max_output_tokens: in
 
     last_debug = ""
     for attempt in range(5):
-        resp = requests.post(url, json=payload, timeout=30)
+        resp = requests.post(url, json=payload, timeout=60)
 
-        # transient retry
+        # retry on transient errors
         if resp.status_code in (429, 500, 502, 503, 504):
             time.sleep(2 ** attempt)
             continue
 
-        # 401/403/400 などはここで落ちる（=キー/権限/リクエスト不正が分かる）
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            body = resp.text[:500].replace("\n", " ")
+            raise RuntimeError(f"HTTP {resp.status_code}: {e}; body={body}")
 
-        # 念のため error を拾う（通常は4xxになるが、まれに200でも入ることがある）
+        data = resp.json() if resp.content else {}
+
         if isinstance(data, dict) and "error" in data:
             err = data["error"]
-            return f"（要約生成に失敗: API error {err.get('code')} {err.get('status')} {err.get('message')}）"
+            return f"（要約生成に失敗: API error code={err.get('code')} status={err.get('status')} msg={err.get('message')}）"
+
+        pf = data.get("promptFeedback") or {}
+        block = pf.get("blockReason")
+        safety = pf.get("safetyRatings")
 
         candidates = data.get("candidates") or []
         if not candidates:
-            pf = data.get("promptFeedback") or {}
-            block = pf.get("blockReason")
-            last_debug = f"no candidates; blockReason={block}"
+            last_debug = f"no candidates; blockReason={block}; safetyRatings={safety}"
             time.sleep(1.5 * (attempt + 1))
             continue
 
@@ -183,7 +197,6 @@ def gemini_generate(model: str, api_key: str, prompt: str, max_output_tokens: in
         content = c0.get("content") or {}
         parts = content.get("parts") or []
 
-        # parts の text を全部結合（parts[0]固定をやめる）
         texts = []
         for p in parts:
             t = p.get("text")
@@ -194,12 +207,10 @@ def gemini_generate(model: str, api_key: str, prompt: str, max_output_tokens: in
         if text_out:
             return text_out
 
-        # 200だけど空（finishReasonだけある等）→ リトライ
-        last_debug = f"empty text; finishReason={finish}; parts={len(parts)}"
+        last_debug = f"empty text; finishReason={finish}; parts={len(parts)}; blockReason={block}"
         time.sleep(1.5 * (attempt + 1))
 
     return f"（要約生成に失敗: retry exhausted; last={last_debug}）"
-
 
 
 def summarize_with_gemini(model: str, title: str, abstract: str, max_output_tokens: int, temperature: float) -> str:
@@ -229,6 +240,15 @@ Abstract: {abstract}
     )
 
 
+def _strip_code_fences(s: str) -> str:
+    s = (s or "").strip()
+    # Remove ```yaml ... ``` or ``` ... ```
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+
 def summarize_batch_with_gemini(
     model: str,
     papers: List[dict],
@@ -236,10 +256,6 @@ def summarize_batch_with_gemini(
     temperature: float,
     abstract_max_chars: int = 1200,
 ) -> Dict[str, str]:
-    """
-    1回のAPI呼び出しで複数論文をまとめて要約し、id->summary の dict を返す。
-    出力はYAML固定で返させてパースする。
-    """
     api_key = os.getenv("GOOGLE_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY is not set")
@@ -270,6 +286,7 @@ summaries:
 - id は入力の id をそのまま使う
 - summaries 以外のキーは出力しない
 - YAML を壊さない（インデント厳守）
+- コードフェンス（```）を付けない
 
 論文一覧:
 {chr(10).join(items)}
@@ -283,12 +300,13 @@ summaries:
         temperature=temperature,
     )
 
+    text = _strip_code_fences(text)
+
     try:
         data = yaml.safe_load(text)
         if isinstance(data, dict):
             summaries = data.get("summaries", {})
             if isinstance(summaries, dict):
-                # 文字列以外が混じったら弾く
                 out: Dict[str, str] = {}
                 for k, v in summaries.items():
                     if isinstance(k, str) and isinstance(v, str):
@@ -362,7 +380,7 @@ def main() -> None:
 
     ensure_dirs(data_dir, out_dir)
 
-    date_str = today_str_with_offset_hours()
+    date_str = today_str_jst()
 
     arxiv_cfg = cfg.get("arxiv", {})
     query = arxiv_cfg.get("query", "cat:cs.CV")
@@ -384,7 +402,7 @@ def main() -> None:
         exclude = filt_cfg.get("exclude", []) or []
         min_score = int(filt_cfg.get("min_score", 2))
         required_any = filt_cfg.get("required_any", []) or []
-        top_k = int(filt_cfg.get("top_k", 0))  # 0なら制限なし
+        top_k = int(filt_cfg.get("top_k", 0))
 
         filtered: List[dict] = []
         for p in chosen:
@@ -411,49 +429,91 @@ def main() -> None:
     enable_sum = bool(sum_cfg.get("enable", False))
     if enable_sum and filtered:
         model = str(sum_cfg.get("model", "gemini-2.5-flash-lite"))
-        max_out = int(sum_cfg.get("max_output_tokens", 180))
         temperature = float(sum_cfg.get("temperature", 0.3))
+        per_paper_tokens = int(sum_cfg.get("max_output_tokens", 180))
 
-        # batch config
-        batch_cfg = (sum_cfg.get("batch", {}) or {})
-        batch_enable = bool(batch_cfg.get("enable", True))
-        batch_size = int(batch_cfg.get("batch_size", 5))
-        abstract_max_chars = int(batch_cfg.get("abstract_max_chars", 1200))
-
-        # safety clamp
-        if batch_size < 1:
-            batch_size = 1
-        if abstract_max_chars < 200:
-            abstract_max_chars = 200
-
-        if batch_enable and batch_size > 1:
-            for i in range(0, len(filtered), batch_size):
-                chunk = filtered[i:i + batch_size]
-                try:
-                    mapping = summarize_batch_with_gemini(
-                        model=model,
-                        papers=chunk,
-                        max_output_tokens=max_out,
-                        temperature=temperature,
-                        abstract_max_chars=abstract_max_chars,
-                    )
-                    for p in chunk:
-                        p["llm_summary"] = mapping.get(p["id"], "（要約生成に失敗）")
-                except Exception as e:
-                    for p in chunk:
-                        p["llm_summary"] = f"（要約エラー: {e}）"
+        api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+        if not api_key:
+            print("[gemini] GOOGLE_API_KEY not set", file=sys.stderr)
         else:
-            for p in filtered:
-                try:
-                    p["llm_summary"] = summarize_with_gemini(
-                        model=model,
-                        title=p.get("title", ""),
-                        abstract=p.get("summary", ""),
-                        max_output_tokens=max_out,
-                        temperature=temperature,
-                    )
-                except Exception as e:
-                    p["llm_summary"] = f"（要約エラー: {e}）"
+            # --- sanity check once ---
+            try:
+                test = gemini_generate(
+                    model=model,
+                    api_key=api_key,
+                    prompt="Say 'OK' only.",
+                    max_output_tokens=8,
+                    temperature=0.0,
+                )
+                print(f"[gemini sanity] {test[:80]}")
+            except Exception as e:
+                print(f"[gemini sanity error] {e}")
+
+            # batch config
+            batch_cfg = (sum_cfg.get("batch", {}) or {})
+            batch_enable = bool(batch_cfg.get("enable", True))
+            batch_size = int(batch_cfg.get("batch_size", 5))
+            abstract_max_chars = int(batch_cfg.get("abstract_max_chars", 1200))
+            fallback_single = bool(batch_cfg.get("fallback_single_on_missing", True))
+
+            # safety clamp
+            batch_size = max(batch_size, 1)
+            abstract_max_chars = max(abstract_max_chars, 200)
+
+            # batch max output tokens (important!)
+            batch_max_tokens = batch_cfg.get("max_output_tokens", None)
+            if batch_max_tokens is None:
+                batch_max_tokens = per_paper_tokens * batch_size
+            batch_max_tokens = int(batch_max_tokens)
+
+            if batch_enable and batch_size > 1:
+                for i in range(0, len(filtered), batch_size):
+                    chunk = filtered[i:i + batch_size]
+                    try:
+                        mapping = summarize_batch_with_gemini(
+                            model=model,
+                            papers=chunk,
+                            max_output_tokens=batch_max_tokens,
+                            temperature=temperature,
+                            abstract_max_chars=abstract_max_chars,
+                        )
+                        for p in chunk:
+                            pid = p["id"]
+                            if pid in mapping:
+                                p["llm_summary"] = mapping[pid]
+                            else:
+                                p["llm_summary"] = "（要約生成に失敗: batch missing id）"
+
+                        # optional fallback for missing ones
+                        if fallback_single:
+                            missing = [p for p in chunk if "batch missing id" in (p.get("llm_summary") or "")]
+                            for p in missing:
+                                try:
+                                    p["llm_summary"] = summarize_with_gemini(
+                                        model=model,
+                                        title=p.get("title", ""),
+                                        abstract=p.get("summary", ""),
+                                        max_output_tokens=per_paper_tokens,
+                                        temperature=temperature,
+                                    )
+                                except Exception as e:
+                                    p["llm_summary"] = f"（要約エラー: {e}）"
+
+                    except Exception as e:
+                        for p in chunk:
+                            p["llm_summary"] = f"（要約エラー: {e}）"
+            else:
+                for p in filtered:
+                    try:
+                        p["llm_summary"] = summarize_with_gemini(
+                            model=model,
+                            title=p.get("title", ""),
+                            abstract=p.get("summary", ""),
+                            max_output_tokens=per_paper_tokens,
+                            temperature=temperature,
+                        )
+                    except Exception as e:
+                        p["llm_summary"] = f"（要約エラー: {e}）"
 
     # update seen (mark all fetched, not just filtered)
     for p in papers:
